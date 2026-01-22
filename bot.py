@@ -1,140 +1,134 @@
 import os
-import json
-from datetime import datetime, date
-import pytz
+import logging
+from datetime import datetime, time
 
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
-    MessageHandler,
     ContextTypes,
-    filters,
 )
 
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
-
-# ==============================
+# =========================
 # НАСТРОЙКИ
-# ==============================
+# =========================
 
-TOKEN = os.getenv("BOT_TOKEN")  # токен будет в Render Environment
-DATA_FILE = "users.json"
-TIMEZONE = pytz.timezone("Europe/Moscow")
+TOKEN = os.getenv("BOT_TOKEN")
+
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN not found in environment variables")
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+
+# =========================
+# МОТИВАЦИЯ
+# =========================
+
+MOTIVATION_TEXTS = [
+    "Каждый день — это шаг вперёд. Даже если он маленький.",
+    "Ты уже прошёл больше, чем думаешь.",
+    "Стабильность важнее скорости.",
+    "Сегодня ты стал опытнее, чем вчера.",
+    "Не сравнивай себя с другими — сравнивай с собой вчера.",
+    "Твоя жизнь — длинный марафон, а не спринт.",
+    "Дисциплина создаёт свободу.",
+    "Ты всё ещё в игре. А это главное.",
+]
 
 
-# ==============================
-# ХРАНЕНИЕ ДАННЫХ
-# ==============================
-
-def load_users():
-    if not os.path.exists(DATA_FILE):
-        return {}
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+def get_motivation() -> str:
+    return MOTIVATION_TEXTS[datetime.now().day % len(MOTIVATION_TEXTS)]
 
 
-def save_users(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-users = load_users()
-
-
-# ==============================
-# ЛОГИКА
-# ==============================
-
-def days_lived(birthdate: date) -> int:
-    return (date.today() - birthdate).days
-
+# =========================
+# КОМАНДЫ
+# =========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привет! 👋\n"
-        "Я DayCountBot.\n\n"
-        "Отправь дату рождения в формате:\n"
+        "Привет 👋\n\n"
+        "Я DayCountBot.\n"
+        "Напиши дату рождения в формате:\n"
         "ДД.ММ.ГГГГ\n\n"
-        "Пример: 22.04.1983"
+        "Например: 22.04.1983"
     )
 
 
-async def handle_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_birthdate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
     try:
-        birth = datetime.strptime(text, "%d.%m.%Y").date()
+        birthdate = datetime.strptime(text, "%d.%m.%Y").date()
     except ValueError:
         await update.message.reply_text(
-            "Неверный формат.\n"
-            "Пример: 22.04.1983"
+            "Неверный формат.\nПример: 22.04.1983"
         )
         return
 
-    chat_id = str(update.effective_chat.id)
+    context.user_data["birthdate"] = birthdate
 
-    users[chat_id] = {
-        "birthdate": birth.isoformat()
-    }
-
-    save_users(users)
-
-    lived = days_lived(birth)
+    days = (datetime.now().date() - birthdate).days + 1
 
     await update.message.reply_text(
         f"Запомнил ✅\n\n"
-        f"Сегодня твой **{lived}-й день жизни**."
+        f"Сегодня твой {days}-й день жизни.\n\n"
+        f"{get_motivation()}"
     )
 
 
-# ==============================
+# =========================
 # ЕЖЕДНЕВНАЯ РАССЫЛКА
-# ==============================
+# =========================
 
-async def daily_message(app):
-    for chat_id, data in users.items():
-        birth = date.fromisoformat(data["birthdate"])
-        lived = days_lived(birth)
+async def daily_message(context: ContextTypes.DEFAULT_TYPE):
+    for chat_id, data in context.application.user_data.items():
+        birthdate = data.get("birthdate")
+        if not birthdate:
+            continue
+
+        days = (datetime.now().date() - birthdate).days + 1
 
         text = (
-            f"🌅 Доброе утро!\n\n"
-            f"Сегодня твой **{lived}-й день жизни**.\n\n"
-            f"Каждый день — это маленькая жизнь."
+            f"📅 Сегодня твой {days}-й день жизни.\n\n"
+            f"{get_motivation()}"
         )
 
         try:
-            await app.bot.send_message(chat_id=int(chat_id), text=text)
+            await context.bot.send_message(chat_id=chat_id, text=text)
         except Exception as e:
-            print("Ошибка отправки:", e)
+            logging.warning(f"Send error to {chat_id}: {e}")
 
 
-# ==============================
+# =========================
 # ЗАПУСК
-# ==============================
+# =========================
 
-async def main():
+def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_date))
+    app.add_handler(CommandHandler("help", start))
+    app.add_handler(CommandHandler("reset", start))
 
-    scheduler = AsyncIOScheduler(timezone=TIMEZONE)
-    scheduler.add_job(
-        daily_message,
-        trigger="cron",
-        hour=9,
-        minute=0,
-        args=[app],
+    app.add_handler(
+        CommandHandler(
+            command=None,
+            callback=handle_birthdate,
+        )
     )
-    scheduler.start()
 
-    print("✅ DayCountBot запущен")
+    # каждый день в 09:00 по серверному времени
+    app.job_queue.run_daily(
+        daily_message,
+        time=time(hour=9, minute=0),
+    )
 
-    await app.run_polling()
+    print("✅ DayCountBot started")
+    app.run_polling()
 
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    main()
