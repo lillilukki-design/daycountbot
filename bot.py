@@ -14,12 +14,32 @@ from telegram.ext import (
 )
 
 # =========================
+# TIMEZONE (Moscow by default)
+# =========================
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+except Exception:
+    ZoneInfo = None  # type: ignore
+
+TZ_NAME = os.getenv("TZ_NAME", "Europe/Moscow")
+if ZoneInfo:
+    TZ = ZoneInfo(TZ_NAME)
+else:
+    TZ = None  # fallback (will behave like server local time)
+
+def today_local() -> date:
+    if TZ:
+        return datetime.now(TZ).date()
+    return date.today()
+
+# =========================
 # CONFIG
 # =========================
 TOKEN = os.getenv("BOT_TOKEN")
 DATA_FILE = "users.json"
 
-DAILY_SEND_TIME = dtime(hour=9, minute=0)
+# Daily send time (09:00 Moscow)
+DAILY_SEND_TIME = dtime(hour=9, minute=0, tzinfo=TZ) if TZ else dtime(hour=9, minute=0)
 
 FREQ_DAILY = "daily"
 FREQ_TENS = "tens"
@@ -56,7 +76,6 @@ def pick_motivation(chat_id: int, days: int) -> str:
 # =========================
 # TASK CATEGORIES
 # =========================
-# Порядок категорий: гарантирует разнообразие (не повтор подряд)
 CATEGORY_ORDER = ["Тело", "Ум", "Восстановление", "Порядок", "Смысл"]
 
 TASKS_BY_CATEGORY: Dict[str, list[str]] = {
@@ -98,8 +117,7 @@ TASKS_BY_CATEGORY: Dict[str, list[str]] = {
 }
 
 def category_and_task_for_today() -> Tuple[str, str]:
-    """Единые категория+задание на текущую дату (одинаково для всех пользователей)."""
-    day_index = date.today().toordinal()
+    day_index = today_local().toordinal()
     category = CATEGORY_ORDER[day_index % len(CATEGORY_ORDER)]
     tasks = TASKS_BY_CATEGORY[category]
     task = tasks[day_index % len(tasks)]
@@ -137,20 +155,21 @@ def parse_birthdate(text: str) -> Optional[date]:
     except ValueError:
         return None
 
-def days_lived(bday: date) -> int:
-    return (date.today() - bday).days
+def day_number_of_life(bday: date) -> int:
+    # ПОРЯДКОВЫЙ день жизни: день рождения = 1
+    return (today_local() - bday).days + 1
 
-def should_notify(freq: str, days: int) -> bool:
+def should_notify(freq: str, day_num: int) -> bool:
     if freq == FREQ_DAILY:
         return True
     if freq == FREQ_TENS:
-        return days % 10 == 0
+        return day_num % 10 == 0
     if freq == FREQ_HUNDREDS:
-        return days % 100 == 0
+        return day_num % 100 == 0
     return True
 
-def format_days_message(days: int) -> str:
-    return f"Сегодня твой {days}-й день жизни."
+def format_days_message(day_num: int) -> str:
+    return f"Сегодня твой {day_num}-й день жизни."
 
 def human_freq(freq: str) -> str:
     if freq == FREQ_DAILY:
@@ -257,10 +276,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     }
     set_user(users, chat_id, u)
 
-    days = days_lived(bday)
-    msg = format_days_message(days)
-    mot = pick_motivation(chat_id, days)
-
+    day_num = day_number_of_life(bday)
+    msg = format_days_message(day_num)
+    mot = pick_motivation(chat_id, day_num)
     cat, task = category_and_task_for_today()
 
     await update.message.reply_text(
@@ -287,12 +305,12 @@ async def daily_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             freq = u.get("freq", FREQ_DAILY)
             tasks_enabled = bool(u.get("tasks_enabled", False))
 
-            days = days_lived(bday)
-            if not should_notify(freq, days):
+            day_num = day_number_of_life(bday)
+            if not should_notify(freq, day_num):
                 continue
 
-            msg = format_days_message(days)
-            mot = pick_motivation(chat_id, days)
+            msg = format_days_message(day_num)
+            mot = pick_motivation(chat_id, day_num)
 
             text = f"{msg}\n\n{mot}"
 
