@@ -1,5 +1,6 @@
-python-telegram-bot[job-queue]==20.6
-tzdata>=2024.1
+python-telegram-bot[job-queue]==20.7
+apscheduler==3.10.4
+
 
 
 
