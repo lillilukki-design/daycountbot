@@ -14,7 +14,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -169,7 +168,6 @@ class DataStore:
         try:
             return json.loads(self.path.read_text(encoding="utf-8"))
         except Exception:
-            # если файл битый — не падаем
             return {"users": {}}
 
     def _write(self, data: Dict[str, Any]) -> None:
@@ -243,7 +241,6 @@ def _stable_int_seed(chat_id: int, day: date) -> int:
 
 
 def build_plan(chat_id: int, day: date) -> Dict[str, str]:
-    # детерминированный выбор задач на день, чтобы план не прыгал
     seed = _stable_int_seed(chat_id, day)
     plan: Dict[str, str] = {}
     for i, cat in enumerate(CATEGORY_ORDER):
@@ -262,15 +259,16 @@ def get_or_create_today_plan(chat_id: int, tz: ZoneInfo) -> Dict[str, str]:
     plans: Dict[str, Dict[str, str]] = u.get("plans", {}) or {}
     plan = plans.get(today)
     if plan:
-        # гарантируем наличие всех категорий (на случай старых данных)
         changed = False
+        fresh_plan = build_plan(chat_id, datetime.now(tz).date())
         for cat in CATEGORY_ORDER:
             if cat not in plan:
-                plan[cat] = build_plan(chat_id, datetime.now(tz).date())[cat]
+                plan[cat] = fresh_plan[cat]
                 changed = True
         if changed:
             STORE.set_plan(chat_id, today, plan)
         return plan
+
     plan = build_plan(chat_id, datetime.now(tz).date())
     STORE.set_plan(chat_id, today, plan)
     return plan
@@ -304,7 +302,6 @@ def schedule_user(app: Application, chat_id: int) -> None:
 
     clear_user_jobs(app, chat_id)
 
-    # В PTB JobQueue timezone параметра НЕТ — используем tzinfo у time()
     jq.run_daily(job_morning, time=SCHEDULE_TIMES["morning"], name=f"user:{chat_id}:morning", data={"chat_id": chat_id})
     jq.run_daily(job_noon, time=SCHEDULE_TIMES["noon"], name=f"user:{chat_id}:noon", data={"chat_id": chat_id})
     jq.run_daily(job_afternoon, time=SCHEDULE_TIMES["afternoon"], name=f"user:{chat_id}:afternoon", data={"chat_id": chat_id})
@@ -332,9 +329,17 @@ def header_text() -> str:
     )
 
 
-def morning_text(plan: Dict[str, str]) -> str:
+def days_lived(dob_iso: str, tz: ZoneInfo) -> int:
+    dob = date.fromisoformat(dob_iso)
+    today = datetime.now(tz).date()
+    return (today - dob).days + 1
+
+
+def morning_text(plan: Dict[str, str], dob_iso: str, tz: ZoneInfo) -> str:
+    lived = days_lived(dob_iso, tz)
     return (
         "🌅 Доброе утро.\n"
+        f"Сегодня твой <b>{lived}-й</b> день жизни.\n\n"
         "Твой план на сегодня — <b>6 коротких шагов</b>. Без перегруза, но по делу.\n"
         "Сохрани это сообщение (или просто знай: план всегда доступен через /today).\n\n"
         f"{format_plan(plan)}\n\n"
@@ -397,10 +402,15 @@ async def job_morning(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = int(ctx.job.data["chat_id"])
     u = STORE.get_user(chat_id)
     tz = ZoneInfo(u.get("tz") or DEFAULT_TZ_NAME)
+
+    dob_iso = u.get("dob")
+    if not dob_iso:
+        return
+
     plan = get_or_create_today_plan(chat_id, tz)
     await ctx.bot.send_message(
         chat_id=chat_id,
-        text=morning_text(plan),
+        text=morning_text(plan, dob_iso, tz),
         parse_mode=ParseMode.HTML,
         reply_markup=kb(
             [("✅ Принял", "ack_plan"), ("📌 Показать /today", "show_today")]
@@ -461,7 +471,6 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     u = STORE.get_user(chat_id)
 
-    # Важно: НЕ спрашиваем снова частоту — у нас фиксированный "Интенсив"
     schedule_user(context.application, chat_id)
 
     if not u.get("dob"):
@@ -483,8 +492,12 @@ async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     plan = get_or_create_today_plan(chat_id, tz)
+    lived = days_lived(u["dob"], tz)
+
     await update.message.reply_text(
-        "📌 <b>План на сегодня</b>\n\n" + format_plan(plan),
+        f"📌 <b>План на сегодня</b>\n"
+        f"Сегодня твой <b>{lived}-й</b> день жизни.\n\n"
+        f"{format_plan(plan)}",
         parse_mode=ParseMode.HTML,
         reply_markup=kb([("✅ Ок", "ack_plan")]),
     )
@@ -492,7 +505,6 @@ async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    # Просто пересоздаём расписание (без изменения частоты — она фиксирована)
     schedule_user(context.application, chat_id)
     await update.message.reply_text(
         "Настройки ✅\n"
@@ -525,12 +537,6 @@ def parse_dob(text: str) -> Optional[str]:
     return d.isoformat()
 
 
-def days_lived(dob_iso: str, tz: ZoneInfo) -> int:
-    dob = date.fromisoformat(dob_iso)
-    today = datetime.now(tz).date()
-    return (today - dob).days + 1
-
-
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     u = STORE.get_user(chat_id)
@@ -554,7 +560,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # Если дата рождения уже есть — отвечаем как ассистент
     if u.get("dob"):
         await update.message.reply_text("Я рядом ✅ Если нужно — /today покажет план дня.")
     else:
@@ -575,26 +580,29 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     data = q.data or ""
 
-    # универсально: показать план
     if data == "show_today":
         plan = get_or_create_today_plan(chat_id, tz)
+        lived = days_lived(u["dob"], tz) if u.get("dob") else None
+
+        prefix = "📌 <b>План на сегодня</b>\n\n"
+        if lived is not None:
+            prefix = f"📌 <b>План на сегодня</b>\nСегодня твой <b>{lived}-й</b> день жизни.\n\n"
+
         await q.message.reply_text(
-            "📌 <b>План на сегодня</b>\n\n" + format_plan(plan),
+            prefix + format_plan(plan),
             parse_mode=ParseMode.HTML,
         )
         return
 
-    # просто подтверждения
     if data == "ack_plan":
         STORE.set_progress(chat_id, dk, "plan_ack", True)
         await q.message.reply_text("✅ Принято. План остаётся доступным — в любой момент /today.")
         return
 
-    # чек-ины
     if data.startswith("noon_"):
         STORE.set_progress(chat_id, dk, "noon", data)
         if data == "noon_done":
-            await q.message.reply_text("🔥 Отлично. Закрепи: что именно сделал(а)? (можно не писать — просто отметь для себя)")
+            await q.message.reply_text("🔥 Отлично. Закрепи это ощущение: ты уже двигаешься вперёд.")
         elif data == "noon_notyet":
             await q.message.reply_text("Ок. Тогда мини-шаг: выбери <b>одну</b> задачу и сделай 5 минут. Старт важнее идеала.", parse_mode=ParseMode.HTML)
         else:
@@ -606,7 +614,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if data == "aft_yes":
             await q.message.reply_text("✅ Супер. Маленькая победа = реальный прогресс.")
         elif data == "aft_partial":
-            await q.message.reply_text("🟡 Нормально. Частично — это всё равно «сделал».")
+            await q.message.reply_text("🟡 Нормально. Частично — это тоже движение.")
         else:
             await q.message.reply_text("⏳ Ок. Тогда вечером сделаем «лёгкую версию» — 10 минут тоже считаются.")
         return
@@ -618,7 +626,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         elif data == "eve_workout_light":
             await q.message.reply_text("🧘 Лёгкая версия — топ. Сделай 10 минут и остановись.")
         else:
-            await q.message.reply_text("😴 Отдых — часть дисциплины. Восстановление тоже задача.")
+            await q.message.reply_text("😴 Отдых — тоже часть дисциплины. Восстановление важно.")
         return
 
     if data == "late_done":
@@ -628,7 +636,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # -----------------------
-# ERROR HANDLER (чтобы не было “No error handlers…”)
+# ERROR HANDLER
 # -----------------------
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.exception("Unhandled exception: %s", context.error)
@@ -638,7 +646,6 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 # MAIN
 # -----------------------
 async def post_init(app: Application) -> None:
-    # Пересоздаём расписания всем, кто уже есть в базе
     await schedule_all_users(app)
     log.info("Post-init done. Users scheduled: %d", len(STORE.all_chat_ids()))
 
@@ -665,8 +672,6 @@ def main() -> None:
     app.add_error_handler(on_error)
 
     log.info("%s starting…", BOT_NAME)
-
-    # важно: drop_pending_updates, чтобы после рестарта не ловить старые апдейты
     app.run_polling(drop_pending_updates=True, close_loop=False)
 
 
