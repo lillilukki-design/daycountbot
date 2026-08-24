@@ -1,26 +1,14 @@
-# bot.py
-# NewYouDay_bot — коуч-ассистент с планом дня + чек-инами (Москва, GMT+3)
-# Render: Background Worker, стартовая команда: python bot.py
-#
-# ENV:
-#   BOT_TOKEN   - токен Telegram бота
-#   DATA_DIR    - папка для хранения данных (опц.), например /var/data (Render Disk)
-#
-# Команды:
-#   /start      - начать
-#   /today      - показать план на сегодня
-#   /settings   - пересоздать расписание (если вдруг сбилось)
-#   /reset      - сбросить дату рождения и планы
-
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import re
+import signal
 import hashlib
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -643,11 +631,133 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # -----------------------
+# MARKETPLACE-БОТ (маркетплейс-агент: Ozon/WB/Яндекс Маркет)
+# -----------------------
+# Второй, полностью независимый Telegram-бот в этом же процессе — свой
+# токен (MARKET_BOT_TOKEN), свои команды, своя база (market/db.py на том
+# же постоянном диске). Если что-то в этой части сломается — на
+# daycountbot это никак не влияет, см. run_both() ниже.
+from market.collect_and_notify import collect_and_notify, build_report_text  # noqa: E402
+
+MARKET_DAILY_TIME = time(9, 0, tzinfo=DEFAULT_TZ)
+
+
+async def market_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    target_date = datetime.now(DEFAULT_TZ).date() - timedelta(days=1)
+    try:
+        text = build_report_text(target_date)
+    except Exception as exc:
+        log.exception("Ошибка при построении отчёта по /report: %s", exc)
+        text = "Не получилось построить отчёт — {}".format(exc)
+    await update.message.reply_text(text)
+
+
+async def market_daily_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = os.getenv("MARKET_CHAT_ID", "").strip()
+    if not chat_id:
+        log.warning("MARKET_CHAT_ID не задан — авто-отчёт по маркетплейсам не отправлен.")
+        return
+    try:
+        await collect_and_notify(ctx.bot, chat_id)
+    except Exception:
+        log.exception("Ошибка в ежедневном сборе/отправке отчёта по маркетплейсам")
+
+
+def build_market_app() -> Optional[Application]:
+    token = os.getenv("MARKET_BOT_TOKEN", "").strip()
+    if not token:
+        log.warning(
+            "MARKET_BOT_TOKEN не задан — бот отчётов по маркетплейсам не запущен "
+            "(daycountbot при этом работает как обычно)."
+        )
+        return None
+
+    market_app = Application.builder().token(token).build()
+    market_app.add_handler(CommandHandler("report", market_report_cmd))
+    market_app.add_error_handler(on_error)
+    return market_app
+
+
+# -----------------------
 # MAIN
 # -----------------------
 async def post_init(app: Application) -> None:
     await schedule_all_users(app)
     log.info("Post-init done. Users scheduled: %d", len(STORE.all_chat_ids()))
+
+
+async def _start_app(app: Application) -> bool:
+    """Поднимает одно Application вручную (initialize -> post_init ->
+    start_polling -> start) — тот же порядок, что и внутри run_polling(),
+    но так можно запустить несколько ботов в одном процессе одновременно.
+    Возвращает True при успехе; при ошибке логирует и возвращает False,
+    не роняя весь процесс."""
+    try:
+        await app.initialize()
+        if app.post_init:
+            await app.post_init(app)
+        await app.updater.start_polling(drop_pending_updates=True)
+        await app.start()
+        return True
+    except Exception:
+        log.exception("Не удалось запустить бота")
+        return False
+
+
+async def _stop_app(app: Application) -> None:
+    try:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+    except Exception:
+        log.exception("Ошибка при остановке бота")
+
+
+async def run_both(app: Application, market_app: Optional[Application]) -> None:
+    started: list[Application] = []
+
+    ok = await _start_app(app)
+    if not ok:
+        # daycountbot — основной бот; если он не поднялся, продолжать нет смысла
+        raise RuntimeError("daycountbot не запустился")
+    started.append(app)
+
+    if market_app is not None:
+        market_ok = await _start_app(market_app)
+        if market_ok:
+            started.append(market_app)
+            market_app.job_queue.run_daily(
+                market_daily_job,
+                time=MARKET_DAILY_TIME,
+                name="market:daily_collect_and_notify",
+            )
+            log.info("Маркетплейс-бот запущен, авто-отчёт в 09:00 (Москва).")
+        else:
+            log.warning(
+                "Маркетплейс-бот не запустился — daycountbot продолжает работать как обычно."
+            )
+
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+
+    def _request_stop(*_args: object) -> None:
+        stop_event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _request_stop)
+        except NotImplementedError:
+            # На некоторых платформах обработчики сигналов через event loop
+            # недоступны — тогда просто не ловим сигнал, процесс завершится
+            # штатно по обычному завершению/SIGKILL.
+            pass
+
+    log.info("Запущено ботов: %d", len(started))
+    await stop_event.wait()
+
+    log.info("Останавливаюсь...")
+    for a in started:
+        await _stop_app(a)
 
 
 def main() -> None:
@@ -671,8 +781,10 @@ def main() -> None:
 
     app.add_error_handler(on_error)
 
+    market_app = build_market_app()
+
     log.info("%s starting…", BOT_NAME)
-    app.run_polling(drop_pending_updates=True, close_loop=False)
+    asyncio.run(run_both(app, market_app))
 
 
 if __name__ == "__main__":
