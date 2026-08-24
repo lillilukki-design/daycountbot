@@ -642,6 +642,22 @@ from market.collect_and_notify import collect_and_notify, build_report_text, col
 MARKET_DAILY_TIME = time(9, 0, tzinfo=DEFAULT_TZ)
 
 
+async def market_myid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показывает chat_id текущего чата — чтобы взять значение для
+    MARKET_CHAT_ID (переменная окружения на Render), не разбираясь, как
+    вообще узнать свой chat_id в Telegram."""
+    message = update.effective_message
+    chat_id = message.chat_id
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "ID этого чата: {}\n\n"
+            "Впиши это значение в переменную MARKET_CHAT_ID на Render, "
+            "чтобы ежедневный авто-отчёт в 09:00 приходил именно сюда."
+        ).format(chat_id),
+    )
+
+
 async def market_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # update.effective_message (а не update.message!) — команда может прийти
     # не только из личного чата/группы, но и постом в канале
@@ -712,6 +728,7 @@ def build_market_app() -> Optional[Application]:
     market_app = Application.builder().token(token).build()
     market_app.add_handler(CommandHandler("report", market_report_cmd))
     market_app.add_handler(CommandHandler("collect", market_collect_cmd))
+    market_app.add_handler(CommandHandler("myid", market_myid_cmd))
     market_app.add_error_handler(on_error)
     return market_app
 
