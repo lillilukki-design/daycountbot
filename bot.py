@@ -649,13 +649,19 @@ async def market_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     # обращение к нему падало с AttributeError, а ошибка тихо уходила в
     # лог через on_error — снаружи выглядело как "бот не отвечает".
     message = update.effective_message
+    # Отвечаем через bot.send_message(chat_id=...) отдельным сообщением, а
+    # НЕ message.reply_text() (это создаёт "ответ" на конкретный пост). Для
+    # канала с привязанным обсуждением такой "ответ" на пост Telegram может
+    # увести в группу обсуждения, а не показать в самом канале — внешне
+    # выглядит как "бот не отвечает", хотя сообщение реально отправлено.
+    chat_id = message.chat_id
     target_date = datetime.now(DEFAULT_TZ).date() - timedelta(days=1)
     try:
         text = build_report_text(target_date)
     except Exception as exc:
         log.exception("Ошибка при построении отчёта по /report: %s", exc)
         text = "Не получилось построить отчёт — {}".format(exc)
-    await message.reply_text(text)
+    await context.bot.send_message(chat_id=chat_id, text=text)
 
 
 async def market_collect_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -663,20 +669,24 @@ async def market_collect_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     09:00). Полезно, чтобы сразу проверить, что площадка реально
     собирается, а не ждать до завтрашнего утра."""
     message = update.effective_message  # см. комментарий в market_report_cmd
+    chat_id = message.chat_id  # см. комментарий в market_report_cmd про send_message
     target_date = datetime.now(DEFAULT_TZ).date() - timedelta(days=1)
-    await message.reply_text(
-        "Собираю данные за {} по всем площадкам, подожди немного…".format(
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="Собираю данные за {} по всем площадкам, подожди немного…".format(
             target_date.strftime("%d.%m.%Y")
-        )
+        ),
     )
     try:
         await asyncio.to_thread(collect_for_date, target_date)
     except Exception as exc:
         log.exception("Ошибка при ручном сборе данных (/collect): %s", exc)
-        await message.reply_text("Не получилось собрать данные — {}".format(exc))
+        await context.bot.send_message(
+            chat_id=chat_id, text="Не получилось собрать данные — {}".format(exc)
+        )
         return
     text = build_report_text(target_date)
-    await message.reply_text(text)
+    await context.bot.send_message(chat_id=chat_id, text=text)
 
 
 async def market_daily_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
