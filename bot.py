@@ -724,7 +724,14 @@ async def _start_app(app: Application) -> bool:
         await app.initialize()
         if app.post_init:
             await app.post_init(app)
-        await app.updater.start_polling(drop_pending_updates=True)
+        # allowed_updates=Update.ALL_TYPES — явно просим у Telegram вообще
+        # все типы обновлений, включая посты в каналах (channel_post).
+        # Без этого при первом же getUpdates без явного allowed_updates
+        # Telegram запоминает набор типов с этого момента и в редких
+        # случаях не включает в него посты каналов, если бот раньше их не
+        # получал — сообщения из канала тогда просто не долетают до
+        # getUpdates, даже если бот в нём администратор.
+        await app.updater.start_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
         await app.start()
         return True
     except Exception:
