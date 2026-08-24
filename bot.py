@@ -643,21 +643,28 @@ MARKET_DAILY_TIME = time(9, 0, tzinfo=DEFAULT_TZ)
 
 
 async def market_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # update.effective_message (а не update.message!) — команда может прийти
+    # не только из личного чата/группы, но и постом в канале
+    # (update.channel_post). Для канала update.message всегда None, и
+    # обращение к нему падало с AttributeError, а ошибка тихо уходила в
+    # лог через on_error — снаружи выглядело как "бот не отвечает".
+    message = update.effective_message
     target_date = datetime.now(DEFAULT_TZ).date() - timedelta(days=1)
     try:
         text = build_report_text(target_date)
     except Exception as exc:
         log.exception("Ошибка при построении отчёта по /report: %s", exc)
         text = "Не получилось построить отчёт — {}".format(exc)
-    await update.message.reply_text(text)
+    await message.reply_text(text)
 
 
 async def market_collect_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Ручной запуск сбора данных прямо сейчас (не ждать авто-отчёт в
     09:00). Полезно, чтобы сразу проверить, что площадка реально
     собирается, а не ждать до завтрашнего утра."""
+    message = update.effective_message  # см. комментарий в market_report_cmd
     target_date = datetime.now(DEFAULT_TZ).date() - timedelta(days=1)
-    await update.message.reply_text(
+    await message.reply_text(
         "Собираю данные за {} по всем площадкам, подожди немного…".format(
             target_date.strftime("%d.%m.%Y")
         )
@@ -666,10 +673,10 @@ async def market_collect_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await asyncio.to_thread(collect_for_date, target_date)
     except Exception as exc:
         log.exception("Ошибка при ручном сборе данных (/collect): %s", exc)
-        await update.message.reply_text("Не получилось собрать данные — {}".format(exc))
+        await message.reply_text("Не получилось собрать данные — {}".format(exc))
         return
     text = build_report_text(target_date)
-    await update.message.reply_text(text)
+    await message.reply_text(text)
 
 
 async def market_daily_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
