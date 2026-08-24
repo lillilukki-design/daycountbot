@@ -9,6 +9,7 @@
 версии для ПК: пользователю нужны данные хотя бы по тем площадкам,
 которые сработали, а не полный отказ из-за одной проблемной.
 """
+import asyncio
 import logging
 from datetime import date, timedelta
 
@@ -65,8 +66,14 @@ def build_report_text(target_date):
 
 async def collect_and_notify(bot, chat_id, target_date=None):
     """Собирает данные за вчера (по умолчанию) и присылает сводку в Telegram.
-    bot — telegram.Bot соответствующего приложения."""
+    bot — telegram.Bot соответствующего приложения.
+
+    collect_for_date() делает обычные синхронные HTTP-запросы (requests),
+    поэтому запускаем её в отдельном потоке через asyncio.to_thread —
+    иначе на время сбора (несколько секунд на 3 площадки) завис бы общий
+    event loop, а вместе с ним и второй бот (daycountbot) в этом же
+    процессе."""
     target_date = target_date or (date.today() - timedelta(days=1))
-    collect_for_date(target_date)
+    await asyncio.to_thread(collect_for_date, target_date)
     text = build_report_text(target_date)
     await bot.send_message(chat_id=chat_id, text=text)

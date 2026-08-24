@@ -637,7 +637,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 # токен (MARKET_BOT_TOKEN), свои команды, своя база (market/db.py на том
 # же постоянном диске). Если что-то в этой части сломается — на
 # daycountbot это никак не влияет, см. run_both() ниже.
-from market.collect_and_notify import collect_and_notify, build_report_text  # noqa: E402
+from market.collect_and_notify import collect_and_notify, build_report_text, collect_for_date  # noqa: E402
 
 MARKET_DAILY_TIME = time(9, 0, tzinfo=DEFAULT_TZ)
 
@@ -649,6 +649,26 @@ async def market_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     except Exception as exc:
         log.exception("Ошибка при построении отчёта по /report: %s", exc)
         text = "Не получилось построить отчёт — {}".format(exc)
+    await update.message.reply_text(text)
+
+
+async def market_collect_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ручной запуск сбора данных прямо сейчас (не ждать авто-отчёт в
+    09:00). Полезно, чтобы сразу проверить, что площадка реально
+    собирается, а не ждать до завтрашнего утра."""
+    target_date = datetime.now(DEFAULT_TZ).date() - timedelta(days=1)
+    await update.message.reply_text(
+        "Собираю данные за {} по всем площадкам, подожди немного…".format(
+            target_date.strftime("%d.%m.%Y")
+        )
+    )
+    try:
+        await asyncio.to_thread(collect_for_date, target_date)
+    except Exception as exc:
+        log.exception("Ошибка при ручном сборе данных (/collect): %s", exc)
+        await update.message.reply_text("Не получилось собрать данные — {}".format(exc))
+        return
+    text = build_report_text(target_date)
     await update.message.reply_text(text)
 
 
@@ -674,6 +694,7 @@ def build_market_app() -> Optional[Application]:
 
     market_app = Application.builder().token(token).build()
     market_app.add_handler(CommandHandler("report", market_report_cmd))
+    market_app.add_handler(CommandHandler("collect", market_collect_cmd))
     market_app.add_error_handler(on_error)
     return market_app
 
