@@ -680,13 +680,12 @@ async def market_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await context.bot.send_message(chat_id=chat_id, text=text)
 
 
-async def market_collect_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Ручной запуск сбора данных прямо сейчас (не ждать авто-отчёт в
-    09:00). Полезно, чтобы сразу проверить, что площадка реально
-    собирается, а не ждать до завтрашнего утра."""
-    message = update.effective_message  # см. комментарий в market_report_cmd
-    chat_id = message.chat_id  # см. комментарий в market_report_cmd про send_message
-    target_date = datetime.now(DEFAULT_TZ).date() - timedelta(days=1)
+async def _collect_and_reply(chat_id, context: ContextTypes.DEFAULT_TYPE, target_date, extra_note=None) -> None:
+    """Общая логика ручного сбора данных за один конкретный день и ответа
+    в чат — используется и для /collect (вчера), и для /today (сегодня по
+    состоянию на текущий момент). extra_note — необязательная строка,
+    которая допишется в конец отчёта (например, пометка, что день ещё не
+    закончился)."""
     await context.bot.send_message(
         chat_id=chat_id,
         text="Собираю данные за {} по всем площадкам, подожди немного…".format(
@@ -696,13 +695,39 @@ async def market_collect_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     try:
         await asyncio.to_thread(collect_for_date, target_date)
     except Exception as exc:
-        log.exception("Ошибка при ручном сборе данных (/collect): %s", exc)
+        log.exception("Ошибка при ручном сборе данных: %s", exc)
         await context.bot.send_message(
             chat_id=chat_id, text="Не получилось собрать данные — {}".format(exc)
         )
         return
     text = build_report_text(target_date)
+    if extra_note:
+        text = "{}\n\n{}".format(text, extra_note)
     await context.bot.send_message(chat_id=chat_id, text=text)
+
+
+async def market_collect_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ручной запуск сбора данных за вчера прямо сейчас (не ждать
+    авто-отчёт в 09:00). Полезно, чтобы сразу проверить, что площадка
+    реально собирается, а не ждать до завтрашнего утра."""
+    message = update.effective_message  # см. комментарий в market_report_cmd
+    chat_id = message.chat_id  # см. комментарий в market_report_cmd про send_message
+    target_date = datetime.now(DEFAULT_TZ).date() - timedelta(days=1)
+    await _collect_and_reply(chat_id, context, target_date)
+
+
+async def market_today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Продажи за сегодня по состоянию на текущий момент (не за полный
+    день — день ещё не закончился). Технически то же самое, что /collect,
+    только дата — сегодня, а не вчера."""
+    message = update.effective_message  # см. комментарий в market_report_cmd
+    chat_id = message.chat_id
+    now = datetime.now(DEFAULT_TZ)
+    target_date = now.date()
+    note = "⏱ Данные по состоянию на {} (сегодняшний день ещё не закончился).".format(
+        now.strftime("%H:%M %d.%m.%Y")
+    )
+    await _collect_and_reply(chat_id, context, target_date, extra_note=note)
 
 
 async def market_daily_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -728,6 +753,7 @@ def build_market_app() -> Optional[Application]:
     market_app = Application.builder().token(token).build()
     market_app.add_handler(CommandHandler("report", market_report_cmd))
     market_app.add_handler(CommandHandler("collect", market_collect_cmd))
+    market_app.add_handler(CommandHandler("today", market_today_cmd))
     market_app.add_handler(CommandHandler("myid", market_myid_cmd))
     market_app.add_error_handler(on_error)
     return market_app
