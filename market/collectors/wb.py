@@ -75,13 +75,28 @@ def collect(config, date_from, date_to, mock=False):
         payout = sale.get("forPay")
         commission = round(price - payout, 2) if payout is not None else None
 
+        # У WB в этом методе нет отдельного поля с полным названием товара
+        # (как у Ozon/Яндекса) — "subject" это категория ("Благовония",
+        # "Топы"...), а не конкретная модель. Чтобы в отчёте не сливались в
+        # одну строку все разные товары одной категории, добавляем к
+        # категории бренд и артикул продавца (то, что сам продавец задавал
+        # при загрузке товара на WB) — этого достаточно, чтобы отличить
+        # один товар от другого, не выдумывая название, которого WB не даёт.
+        subject = sale.get("subject") or ""
+        brand = sale.get("brand") or ""
+        supplier_article = sale.get("supplierArticle") or ""
+        name_parts = [p for p in (subject, brand) if p]
+        if supplier_article:
+            name_parts.append("арт. {}".format(supplier_article))
+        product_name = ", ".join(name_parts) if name_parts else subject
+
         orders.append(
             {
                 "marketplace": "wb",
                 "order_id": str(sale_id or sale.get("srid", "")),
                 "date": sale_date,
                 "sku": str(sale.get("nmId", "")),
-                "product_name": sale.get("subject", ""),
+                "product_name": product_name,
                 "quantity": 1,
                 "price": price,
                 "status": "возврат" if is_return else "продано",
