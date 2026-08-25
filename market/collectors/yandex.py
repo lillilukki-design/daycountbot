@@ -12,13 +12,23 @@ YANDEX_CAMPAIGN_ID=86487209,148752308
 Важно: заголовок авторизации называется "Api-Key" (а не "Authorization") —
 ключ, который выдаётся в кабинете, это не классический OAuth-токен.
 """
+import logging
 from datetime import datetime
 
 import requests
 
 from .common import mock_orders, check_response
 
+log = logging.getLogger("market")
+
 API_URL_TEMPLATE = "https://api.partner.market.yandex.ru/v2/campaigns/{campaign_id}/orders"
+
+# Предохранитель от зависания: если Яндекс вдруг будет бесконечно
+# отдавать nextPageToken (баг на его стороне или у нас в разборе
+# ответа), цикл ниже крутился бы вечно, съедая память и в итоге роняя
+# весь процесс по OOM. 200 страниц по 50 заказов — 10 000 заказов на
+# одну кампанию, для ручной сводки такого объёма не бывает.
+MAX_PAGES = 200
 
 
 def _to_iso_date(creation_date):
@@ -38,7 +48,7 @@ def _collect_for_campaign(token, campaign_id, date_from, date_to):
 
     orders = []
     page_token = None
-    while True:
+    for page in range(MAX_PAGES):
         params = {
             "fromDate": date_from.strftime("%d-%m-%Y"),
             "toDate": date_to.strftime("%d-%m-%Y"),
@@ -83,6 +93,12 @@ def _collect_for_campaign(token, campaign_id, date_from, date_to):
         page_token = (data.get("paging") or {}).get("nextPageToken")
         if not page_token:
             break
+    else:
+        log.warning(
+            "Яндекс Маркет (кампания %s): остановился после %d страниц (%d заказов) — "
+            "похоже на зацикливание, а не на реальный объём данных.",
+            campaign_id, MAX_PAGES, len(orders),
+        )
 
     return orders
 

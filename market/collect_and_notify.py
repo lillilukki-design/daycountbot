@@ -44,7 +44,9 @@ def collect_for_range(date_from, date_to):
             continue
 
         try:
+            log.info("[%s] начинаю сбор за %s..%s", label, date_from, date_to)
             orders = module.collect(config, date_from, date_to)
+            log.info("[%s] сбор завершён, получено записей: %d", label, len(orders))
             saved = save_orders(orders)
             log.info("[%s] получено записей: %d, сохранено: %d", label, len(orders), saved)
             log_run(code, "ok", "", saved)

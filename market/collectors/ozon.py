@@ -9,19 +9,31 @@ FBS (свой склад/сборка), потому что заранее не 
 будет 0 записей — скорее всего вы просто ей не пользуетесь, это не
 ошибка.
 """
+import logging
+
 import requests
 
 from .common import mock_orders, check_response, msk_day_bounds_utc, to_msk_date
 
+log = logging.getLogger("market")
+
 FBO_URL = "https://api-seller.ozon.ru/v3/posting/fbo/list"
 FBS_URL = "https://api-seller.ozon.ru/v3/posting/fbs/list"
+
+# Предохранитель от зависания: если Ozon почему-то будет бесконечно
+# отвечать has_next=true (баг на его стороне или у нас в разборе
+# ответа), без этого лимита цикл крутился бы вечно, съедая память и
+# в итоге роняя весь процесс по OOM (так уже случалось один раз с
+# другим циклом — см. collect_and_notify.py). 200 страниц по 100 штук
+# — это 20 000 отправлений, для ручной сводки такого объёма не бывает.
+MAX_PAGES = 200
 
 
 def _fetch_postings(url, headers, since, to):
     postings = []
     offset = 0
     limit = 100  # у Ozon для этих методов лимит строго от 1 до 100
-    while True:
+    for page in range(MAX_PAGES):
         body = {
             "dir": "ASC",
             "filter": {"since": since, "to": to},
@@ -43,6 +55,12 @@ def _fetch_postings(url, headers, since, to):
         if not result.get("has_next") or not batch:
             break
         offset += limit
+    else:
+        log.warning(
+            "Ozon (%s): остановился после %d страниц (%d отправлений) — "
+            "похоже на зацикливание, а не на реальный объём данных.",
+            url, MAX_PAGES, len(postings),
+        )
     return postings
 
 
