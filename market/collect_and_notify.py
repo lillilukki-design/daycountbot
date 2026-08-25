@@ -16,7 +16,7 @@ from datetime import date, timedelta
 from .config import load_config, check_config
 from .db import save_orders, log_run, fetch_orders_df, fetch_last_runs
 from .collectors import wb, ozon, yandex
-from .report_text import build_daily_message
+from .report_text import build_daily_message, build_range_message
 
 log = logging.getLogger("market")
 
@@ -27,10 +27,11 @@ MARKETPLACES = {
 }
 
 
-def collect_for_date(target_date):
-    """Собирает данные за один день (target_date) со всех площадок и
-    складывает их в базу. Возвращает True, если хотя бы одна площадка
-    собралась без ошибки."""
+def collect_for_range(date_from, date_to):
+    """Собирает данные за диапазон дат (date_from..date_to включительно)
+    со всех площадок и складывает их в базу. Для одного дня date_from ==
+    date_to — этим пользуется collect_for_date(). Возвращает True, если
+    хотя бы одна площадка собралась без ошибки."""
     config = load_config()
     any_ok = False
 
@@ -43,7 +44,7 @@ def collect_for_date(target_date):
             continue
 
         try:
-            orders = module.collect(config, target_date, target_date)
+            orders = module.collect(config, date_from, date_to)
             saved = save_orders(orders)
             log.info("[%s] получено записей: %d, сохранено: %d", label, len(orders), saved)
             log_run(code, "ok", "", saved)
@@ -56,12 +57,27 @@ def collect_for_date(target_date):
     return any_ok
 
 
+def collect_for_date(target_date):
+    """Собирает данные за один день (target_date) со всех площадок."""
+    return collect_for_range(target_date, target_date)
+
+
 def build_report_text(target_date):
     """Строит текст сводки за указанный день из уже собранных данных
     (без обращения к API площадок)."""
     df = fetch_orders_df()
     last_runs = fetch_last_runs()
     return build_daily_message(df, target_date, last_runs=last_runs)
+
+
+def build_report_text_for_range(date_from, date_to, period_label=None):
+    """Строит текст сводки за диапазон дат (например, с начала месяца по
+    сегодня) из уже собранных данных (без обращения к API площадок)."""
+    df = fetch_orders_df()
+    last_runs = fetch_last_runs()
+    return build_range_message(
+        df, date_from, date_to, last_runs=last_runs, period_label=period_label
+    )
 
 
 async def collect_and_notify(bot, chat_id, target_date=None):

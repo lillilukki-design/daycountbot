@@ -20,23 +20,19 @@ def _money(value):
     return "{:,.0f} ₽".format(value or 0).replace(",", " ")
 
 
-def build_daily_message(df, target_date, last_runs=None):
-    """Строит текст сообщения по данным за один день (target_date —
-    объект date). df — вся таблица заказов (db.fetch_orders_df()).
-    last_runs — результат db.fetch_last_runs(), нужен только чтобы
-    подсказать, если 0 заказов у площадки — это ошибка сбора, а не
-    реальное отсутствие продаж."""
+def _build_message(period_df, header_line, last_runs=None, top_label="Топ товаров"):
+    """Общее ядро сборки текста отчёта — принимает уже отфильтрованный по
+    периоду (один день или диапазон дат) кусок таблицы заказов и первую
+    строку заголовка. Используется и build_daily_message (один день), и
+    build_range_message (диапазон, например с начала месяца)."""
     last_runs = last_runs or {}
-    day_str = target_date.strftime("%d.%m.%Y")
 
-    day_df = df[df["date"].dt.date == target_date].copy() if not df.empty else df
-
-    sold = day_df[day_df["status"] != "возврат"].copy()
-    returns = day_df[day_df["status"] == "возврат"] if not day_df.empty else day_df
+    sold = period_df[period_df["status"] != "возврат"].copy()
+    returns = period_df[period_df["status"] == "возврат"] if not period_df.empty else period_df
     sold["revenue"] = sold["price"] * sold["quantity"]
     total_revenue = sold["revenue"].sum()
 
-    lines = ["📊 Отчёт за {}".format(day_str), ""]
+    lines = [header_line, ""]
     lines.append("Суммарная выручка: {}".format(_money(total_revenue)))
     lines.append("Продано позиций: {} шт.".format(int(sold["quantity"].sum()) if not sold.empty else 0))
     if not returns.empty:
@@ -67,7 +63,7 @@ def build_daily_message(df, target_date, last_runs=None):
     )
     if not top_products.empty:
         lines.append("")
-        lines.append("Топ товаров за день:")
+        lines.append("{}:".format(top_label))
         for name, row in top_products.iterrows():
             lines.append("  • {} — {} шт., {}".format(name, int(row["qty"]), _money(row["revenue"])))
 
@@ -75,3 +71,31 @@ def build_daily_message(df, target_date, last_runs=None):
     if len(text) > TELEGRAM_MAX_LEN:
         text = text[: TELEGRAM_MAX_LEN - 50] + "\n\n(отчёт обрезан — слишком длинный)"
     return text
+
+
+def build_daily_message(df, target_date, last_runs=None):
+    """Строит текст сообщения по данным за один день (target_date —
+    объект date). df — вся таблица заказов (db.fetch_orders_df()).
+    last_runs — результат db.fetch_last_runs(), нужен только чтобы
+    подсказать, если 0 заказов у площадки — это ошибка сбора, а не
+    реальное отсутствие продаж."""
+    day_df = df[df["date"].dt.date == target_date].copy() if not df.empty else df
+    header = "📊 Отчёт за {}".format(target_date.strftime("%d.%m.%Y"))
+    return _build_message(day_df, header, last_runs=last_runs, top_label="Топ товаров за день")
+
+
+def build_range_message(df, date_from, date_to, last_runs=None, period_label=None):
+    """То же самое, но за диапазон дат (например, с начала месяца по
+    сегодня) — используется командой /month. period_label, если задан,
+    подставляется в заголовок вместо дат (например, "август 2026")."""
+    if not df.empty:
+        range_df = df[(df["date"].dt.date >= date_from) & (df["date"].dt.date <= date_to)].copy()
+    else:
+        range_df = df
+    if period_label:
+        header = "📊 Отчёт {}".format(period_label)
+    else:
+        header = "📊 Отчёт с {} по {}".format(
+            date_from.strftime("%d.%m.%Y"), date_to.strftime("%d.%m.%Y")
+        )
+    return _build_message(range_df, header, last_runs=last_runs, top_label="Топ товаров за период")

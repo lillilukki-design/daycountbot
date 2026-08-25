@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
     Update,
 )
 from telegram.constants import ParseMode
@@ -637,9 +638,45 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 # токен (MARKET_BOT_TOKEN), свои команды, своя база (market/db.py на том
 # же постоянном диске). Если что-то в этой части сломается — на
 # daycountbot это никак не влияет, см. run_both() ниже.
-from market.collect_and_notify import collect_and_notify, build_report_text, collect_for_date  # noqa: E402
+from market.collect_and_notify import (  # noqa: E402
+    collect_and_notify,
+    build_report_text,
+    build_report_text_for_range,
+    collect_for_date,
+    collect_for_range,
+)
 
 MARKET_DAILY_TIME = time(9, 0, tzinfo=DEFAULT_TZ)
+
+# Постоянная клавиатура с кнопками для 4 самых частых запросов — Telegram
+# показывает её вместо системной клавиатуры набора текста, кнопки не
+# исчезают после нажатия (resize_keyboard просто делает их компактнее).
+# Нажатие присылает боту обычное текстовое сообщение с этим же текстом —
+# ловим его в market_button_cmd (MessageHandler), а не CommandHandler.
+MARKET_KEYBOARD_BUTTONS = [
+    ["📅 Отчёт за вчера", "🔄 Обновить за вчера"],
+    ["⏱ Сегодня", "📆 С начала месяца"],
+]
+MARKET_KEYBOARD = ReplyKeyboardMarkup(MARKET_KEYBOARD_BUTTONS, resize_keyboard=True)
+
+
+async def market_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Приветствие + показ постоянной клавиатуры с кнопками — чтобы не
+    печатать /report, /collect, /today, /month руками каждый раз."""
+    message = update.effective_message
+    chat_id = message.chat_id
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "Привет! Это бот отчётов по маркетплейсам.\n\n"
+            "Внизу — кнопки для самых частых запросов:\n"
+            "📅 Отчёт за вчера — быстро, из уже собранных данных\n"
+            "🔄 Обновить за вчера — заново собрать данные за вчера и показать отчёт\n"
+            "⏱ Сегодня — продажи на текущий момент\n"
+            "📆 С начала месяца — сводка с 1-го числа по сегодня"
+        ),
+        reply_markup=MARKET_KEYBOARD,
+    )
 
 
 async def market_myid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -655,6 +692,7 @@ async def market_myid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "Впиши это значение в переменную MARKET_CHAT_ID на Render, "
             "чтобы ежедневный авто-отчёт в 09:00 приходил именно сюда."
         ).format(chat_id),
+        reply_markup=MARKET_KEYBOARD,
     )
 
 
@@ -677,7 +715,7 @@ async def market_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     except Exception as exc:
         log.exception("Ошибка при построении отчёта по /report: %s", exc)
         text = "Не получилось построить отчёт — {}".format(exc)
-    await context.bot.send_message(chat_id=chat_id, text=text)
+    await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=MARKET_KEYBOARD)
 
 
 async def _collect_and_reply(chat_id, context: ContextTypes.DEFAULT_TYPE, target_date, extra_note=None) -> None:
@@ -703,7 +741,7 @@ async def _collect_and_reply(chat_id, context: ContextTypes.DEFAULT_TYPE, target
     text = build_report_text(target_date)
     if extra_note:
         text = "{}\n\n{}".format(text, extra_note)
-    await context.bot.send_message(chat_id=chat_id, text=text)
+    await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=MARKET_KEYBOARD)
 
 
 async def market_collect_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -730,6 +768,68 @@ async def market_today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await _collect_and_reply(chat_id, context, target_date, extra_note=note)
 
 
+MONTH_NAMES_RU = [
+    "", "январь", "февраль", "март", "апрель", "май", "июнь",
+    "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь",
+]
+
+
+async def market_month_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Продажи с начала текущего месяца по сегодня включительно. WB отдаёт
+    все продажи начиная с указанной даты одним запросом (не по дням), так
+    что это не создаёт дополнительной нагрузки на его лимит запросов по
+    сравнению с /today или /collect — запрос к WB всё равно один."""
+    message = update.effective_message  # см. комментарий в market_report_cmd
+    chat_id = message.chat_id
+    now = datetime.now(DEFAULT_TZ)
+    date_from = now.date().replace(day=1)
+    date_to = now.date()
+    period_label = "за {} {} (с начала месяца)".format(MONTH_NAMES_RU[date_to.month], date_to.year)
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="Собираю данные с {} по {} по всем площадкам, подожди немного…".format(
+            date_from.strftime("%d.%m.%Y"), date_to.strftime("%d.%m.%Y")
+        ),
+    )
+    try:
+        await asyncio.to_thread(collect_for_range, date_from, date_to)
+    except Exception as exc:
+        log.exception("Ошибка при сборе данных за месяц (/month): %s", exc)
+        await context.bot.send_message(
+            chat_id=chat_id, text="Не получилось собрать данные — {}".format(exc)
+        )
+        return
+    text = build_report_text_for_range(date_from, date_to, period_label=period_label)
+    note = "⏱ Данные по состоянию на {} (месяц ещё не закончился).".format(
+        now.strftime("%H:%M %d.%m.%Y")
+    )
+    await context.bot.send_message(
+        chat_id=chat_id, text="{}\n\n{}".format(text, note), reply_markup=MARKET_KEYBOARD
+    )
+
+
+MARKET_BUTTON_HANDLERS = {
+    "📅 Отчёт за вчера": market_report_cmd,
+    "🔄 Обновить за вчера": market_collect_cmd,
+    "⏱ Сегодня": market_today_cmd,
+    "📆 С начала месяца": market_month_cmd,
+}
+
+
+async def market_button_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает нажатия на кнопки постоянной клавиатуры (MARKET_KEYBOARD).
+    Telegram присылает нажатие как обычное текстовое сообщение (без "/"),
+    поэтому это MessageHandler, а не CommandHandler — сверяем текст с
+    подписями кнопок и вызываем ту же функцию, что и у соответствующей
+    команды. Текст, не совпавший ни с одной кнопкой, молча игнорируем."""
+    message = update.effective_message
+    text = (message.text or "").strip()
+    handler = MARKET_BUTTON_HANDLERS.get(text)
+    if handler:
+        await handler(update, context)
+
+
 async def market_daily_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = os.getenv("MARKET_CHAT_ID", "").strip()
     if not chat_id:
@@ -751,10 +851,15 @@ def build_market_app() -> Optional[Application]:
         return None
 
     market_app = Application.builder().token(token).build()
+    market_app.add_handler(CommandHandler("start", market_start_cmd))
     market_app.add_handler(CommandHandler("report", market_report_cmd))
     market_app.add_handler(CommandHandler("collect", market_collect_cmd))
     market_app.add_handler(CommandHandler("today", market_today_cmd))
+    market_app.add_handler(CommandHandler("month", market_month_cmd))
     market_app.add_handler(CommandHandler("myid", market_myid_cmd))
+    # Нажатия на кнопки постоянной клавиатуры приходят как обычный текст —
+    # этот хэндлер должен идти последним и не перехватывать команды (~filters.COMMAND).
+    market_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, market_button_cmd))
     market_app.add_error_handler(on_error)
     return market_app
 
