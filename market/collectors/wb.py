@@ -24,6 +24,7 @@ import json
 import logging
 import time
 from collections import Counter
+from datetime import date, timedelta
 
 import requests
 
@@ -36,6 +37,32 @@ ORDERS_URL = "https://statistics-api.wildberries.ru/api/v1/supplier/orders"
 
 # Оставлено для обратной совместимости — старое имя константы.
 API_URL = SALES_URL
+
+# Установлено на практике (проверено логами 26.08): при dateFrom = начало
+# месяца WB [заказы] вернул только 24 записи с датами 15–26 августа — то
+# есть дальше 1 августа, как просили, он не заглянул, хотя по документации
+# dateFrom фильтрует по lastChangeDate и должен отдавать всё "≥ dateFrom"
+# одним ответом (до ~100 000 строк). Само по себе это не объясняется явно
+# документированным поведением — либо WB на практике режет ответ по
+# какому-то не задокументированному скользящему окну, либо у этого
+# токена/аккаунта интеграция реально не видит более раннюю историю.
+# Проверить это дёшево: всегда запрашивать WB от максимально далёкой
+# разрешённой даты (90 дней хранения) и уже потом самим фильтровать на
+# нужный период — если WB всё-таки способен отдать более раннее, это
+# сразу же станет видно в логах и в отчёте; если нет — по крайней мере
+# перестанем зависеть от того, насколько широкий диапазон запросил вызывающий
+# код (для /today и /collect тут раньше не было запаса вообще).
+MAX_LOOKBACK_DAYS = 89
+
+
+def _query_from(date_from):
+    """Дата, с которой реально стоит запрашивать WB — всегда настолько
+    далеко назад, насколько WB вообще готов отдавать (предел хранения —
+    90 дней), даже если вызывающему коду нужен более узкий период. Само
+    сужение до нужного периода происходит потом, локальной фильтрацией
+    по датам заказов. См. комментарий у MAX_LOOKBACK_DAYS."""
+    earliest = date.today() - timedelta(days=MAX_LOOKBACK_DAYS)
+    return min(date_from, earliest)
 
 
 def _wb_get(url, headers, date_from, label):
@@ -108,7 +135,7 @@ def collect(config, date_from, date_to, mock=False):
 
     token = config["WB_TOKEN"]
     headers = {"Authorization": token}
-    raw_orders = _wb_get(ORDERS_URL, headers, date_from, "заказы")
+    raw_orders = _wb_get(ORDERS_URL, headers, _query_from(date_from), "заказы")
 
     date_from_s = date_from.strftime("%Y-%m-%d")
     date_to_s = date_to.strftime("%Y-%m-%d")
@@ -187,8 +214,9 @@ def collect_feed_summary(config, date_from, date_to):
         d = (raw_date or "")[:10]
         return date_from_s <= d <= date_to_s
 
-    raw_orders = _wb_get(ORDERS_URL, headers, date_from, "заказы")
-    raw_sales = _wb_get(SALES_URL, headers, date_from, "продажи")
+    query_from = _query_from(date_from)
+    raw_orders = _wb_get(ORDERS_URL, headers, query_from, "заказы")
+    raw_sales = _wb_get(SALES_URL, headers, query_from, "продажи")
 
     orders = [o for o in raw_orders if in_range(o.get("date"))]
     # srid — сквозной идентификатор заказа, общий у /orders и /sales

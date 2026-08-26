@@ -32,16 +32,31 @@ MAX_PAGES = 50
 
 
 def _fetch_postings(url, headers, since, to):
+    """Постранично собирает отправления за период.
+
+    ВАЖНО: у метода FBO (v3/posting/fbo/list) на практике offset не
+    работает — при любом значении offset Ozon возвращает одну и ту же
+    первую сотню отправлений, а has_next остаётся true бесконечно (это
+    подтверждено диагностикой ниже: одинаковый диапазон in_process_at и
+    100% повторов posting_number на каждой "странице"). Поэтому вместо
+    offset двигаем окно по времени: после полной пачки в 100 штук
+    следующий запрос делаем с since = in_process_at последней записи в
+    пачке (since у Ozon включительно, поэтому пограничная запись придёт
+    повторно — отсекаем её через seen_numbers, а не пропуском по дате,
+    чтобы не потерять другие отправления с точно такой же меткой
+    времени). offset всё равно передаём (вдруг когда-нибудь заработает),
+    но останавливаемся по фактическому появлению новых записей, а не по
+    его значению."""
     postings = []
     seen_numbers = set()
-    offset = 0
     limit = 100  # у Ozon для этих методов лимит строго от 1 до 100
+    cursor_since = since
     for page in range(MAX_PAGES):
         body = {
             "dir": "ASC",
-            "filter": {"since": since, "to": to},
+            "filter": {"since": cursor_since, "to": to},
             "limit": limit,
-            "offset": offset,
+            "offset": 0,
             "with": {"financial_data": True},
         }
         resp = requests.post(url, headers=headers, json=body, timeout=60)
@@ -53,32 +68,34 @@ def _fetch_postings(url, headers, since, to):
         result = data.get("result", data) if isinstance(data, dict) else {}
         batch = result.get("postings", []) if isinstance(result, dict) else []
 
-        # Диагностика: если Ozon вдруг игнорирует offset и присылает те же
-        # отправления повторно, это будет видно по повторяющимся номерам —
-        # отличаем "реально много данных" от "зациклились на одной странице".
-        batch_numbers = [p.get("posting_number") for p in batch]
-        repeats = sum(1 for n in batch_numbers if n in seen_numbers)
-        seen_numbers.update(batch_numbers)
+        new_in_batch = [p for p in batch if p.get("posting_number") not in seen_numbers]
+        repeats = len(batch) - len(new_in_batch)
+        for p in new_in_batch:
+            seen_numbers.add(p.get("posting_number"))
+        postings.extend(new_in_batch)
+
         first_dt = batch[0].get("in_process_at") if batch else None
         last_dt = batch[-1].get("in_process_at") if batch else None
         log.info(
-            "Ozon (%s) страница %d: offset=%d, получено=%d, повторов из уже виденных=%d, "
+            "Ozon (%s) страница %d: since=%s, получено=%d (новых=%d, повторов=%d), "
             "has_next=%s, in_process_at первой/последней записи в пачке: %s / %s",
-            url, page, offset, len(batch), repeats, result.get("has_next"), first_dt, last_dt,
+            url, page, cursor_since, len(batch), len(new_in_batch), repeats,
+            result.get("has_next"), first_dt, last_dt,
         )
 
-        postings.extend(batch)
-        # Ozon явно говорит, есть ли ещё страницы — так надёжнее, чем
-        # угадывать по количеству полученных записей.
-        if not result.get("has_next") or not batch:
+        if not batch or not new_in_batch:
+            # Пустая страница или сплошные повторы — новых данных больше
+            # нет (курсор по времени не продвигается дальше).
             break
-        offset += limit
+        if len(batch) < limit:
+            # Неполная пачка — это последняя порция за период.
+            break
+        cursor_since = last_dt or cursor_since
     else:
         log.warning(
-            "Ozon (%s): остановился после %d страниц (%d отправлений, из них %d — "
-            "повторно увиденные posting_number) — похоже на зацикливание, а не на "
-            "реальный объём данных.",
-            url, MAX_PAGES, len(postings), len(postings) - len(seen_numbers),
+            "Ozon (%s): остановился после %d страниц (%d новых отправлений) — курсор по "
+            "времени не дошёл до конца периода за отведённое число страниц.",
+            url, MAX_PAGES, len(postings),
         )
     return postings
 
