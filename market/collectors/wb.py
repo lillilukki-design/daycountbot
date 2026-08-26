@@ -21,11 +21,15 @@
   остальной код (база, отчёт) не пострадает.
 """
 import json
+import logging
 import time
+from collections import Counter
 
 import requests
 
 from .common import mock_orders, check_response
+
+log = logging.getLogger("market")
 
 SALES_URL = "https://statistics-api.wildberries.ru/api/v1/supplier/sales"
 ORDERS_URL = "https://statistics-api.wildberries.ru/api/v1/supplier/orders"
@@ -53,8 +57,8 @@ def _wb_get(url, headers, date_from, label):
         if resp.status_code == 429 and attempt == 0:
             wait_seconds = int(resp.headers.get("X-Ratelimit-Retry", 65))
             if wait_seconds <= MAX_AUTO_WAIT:
-                print("  (WB ({}) просит подождать из-за лимита запросов, жду {} сек...)".format(
-                    label, wait_seconds))
+                log.info("WB (%s) просит подождать из-за лимита запросов, жду %s сек...",
+                         label, wait_seconds)
                 time.sleep(wait_seconds)
                 continue
             else:
@@ -68,13 +72,17 @@ def _wb_get(url, headers, date_from, label):
 
     check_response(resp)
     raw = resp.json()
-    print("     (сырых записей от WB [{}] до фильтра по датам: {})".format(label, len(raw)))
+    log.info("WB [%s]: сырых записей до фильтра по датам: %d (dateFrom=%s, запрос по %s)",
+             label, len(raw), params["dateFrom"], url)
     if raw:
-        print("     [диагностика WB {}] первая запись: {}".format(
-            label, json.dumps(raw[0], ensure_ascii=False)[:400]))
+        log.info("WB [%s]: первая запись: %s",
+                  label, json.dumps(raw[0], ensure_ascii=False)[:400])
         dates = sorted((r.get("date") or "")[:10] for r in raw)
-        print("     [диагностика WB {}] диапазон дат в сыром ответе: {} .. {}".format(
-            label, dates[0], dates[-1]))
+        by_day = Counter(dates)
+        log.info("WB [%s]: диапазон дат в сыром ответе: %s .. %s, записей по дням: %s",
+                  label, dates[0], dates[-1], dict(sorted(by_day.items())))
+    else:
+        log.info("WB [%s]: ответ пустой (0 записей) для dateFrom=%s", label, params["dateFrom"])
     return raw
 
 

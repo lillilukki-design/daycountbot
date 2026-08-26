@@ -24,13 +24,16 @@ FBS_URL = "https://api-seller.ozon.ru/v3/posting/fbs/list"
 # отвечать has_next=true (баг на его стороне или у нас в разборе
 # ответа), без этого лимита цикл крутился бы вечно, съедая память и
 # в итоге роняя весь процесс по OOM (так уже случалось один раз с
-# другим циклом — см. collect_and_notify.py). 200 страниц по 100 штук
-# — это 20 000 отправлений, для ручной сводки такого объёма не бывает.
-MAX_PAGES = 200
+# другим циклом — см. collect_and_notify.py). 50 страниц по 100 штук
+# — это 5 000 отправлений, для ручной сводки такого объёма не бывает
+# (снижено со 200: тот лимит один раз реально сработал на зацикливании
+# и съел лишнюю минуту на 200 бесполезных запросов).
+MAX_PAGES = 50
 
 
 def _fetch_postings(url, headers, since, to):
     postings = []
+    seen_numbers = set()
     offset = 0
     limit = 100  # у Ozon для этих методов лимит строго от 1 до 100
     for page in range(MAX_PAGES):
@@ -49,6 +52,21 @@ def _fetch_postings(url, headers, since, to):
         # оба варианта одним кодом.
         result = data.get("result", data) if isinstance(data, dict) else {}
         batch = result.get("postings", []) if isinstance(result, dict) else []
+
+        # Диагностика: если Ozon вдруг игнорирует offset и присылает те же
+        # отправления повторно, это будет видно по повторяющимся номерам —
+        # отличаем "реально много данных" от "зациклились на одной странице".
+        batch_numbers = [p.get("posting_number") for p in batch]
+        repeats = sum(1 for n in batch_numbers if n in seen_numbers)
+        seen_numbers.update(batch_numbers)
+        first_dt = batch[0].get("in_process_at") if batch else None
+        last_dt = batch[-1].get("in_process_at") if batch else None
+        log.info(
+            "Ozon (%s) страница %d: offset=%d, получено=%d, повторов из уже виденных=%d, "
+            "has_next=%s, in_process_at первой/последней записи в пачке: %s / %s",
+            url, page, offset, len(batch), repeats, result.get("has_next"), first_dt, last_dt,
+        )
+
         postings.extend(batch)
         # Ozon явно говорит, есть ли ещё страницы — так надёжнее, чем
         # угадывать по количеству полученных записей.
@@ -57,9 +75,10 @@ def _fetch_postings(url, headers, since, to):
         offset += limit
     else:
         log.warning(
-            "Ozon (%s): остановился после %d страниц (%d отправлений) — "
-            "похоже на зацикливание, а не на реальный объём данных.",
-            url, MAX_PAGES, len(postings),
+            "Ozon (%s): остановился после %d страниц (%d отправлений, из них %d — "
+            "повторно увиденные posting_number) — похоже на зацикливание, а не на "
+            "реальный объём данных.",
+            url, MAX_PAGES, len(postings), len(postings) - len(seen_numbers),
         )
     return postings
 
@@ -119,8 +138,8 @@ def collect(config, date_from, date_to, mock=False):
 
     fbo_postings = _fetch_postings(FBO_URL, headers, since, to)
     fbs_postings = _fetch_postings(FBS_URL, headers, since, to)
-    print("     (по схеме FBO: {} отправлений, по схеме FBS: {} отправлений)".format(
-        len(fbo_postings), len(fbs_postings)))
+    log.info("Ozon: по схеме FBO %d отправлений, по схеме FBS %d отправлений (since=%s, to=%s)",
+             len(fbo_postings), len(fbs_postings), since, to)
 
     orders = []
     for scheme, postings in (("fbo", fbo_postings), ("fbs", fbs_postings)):
