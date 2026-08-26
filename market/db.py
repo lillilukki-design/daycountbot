@@ -51,6 +51,26 @@ def _migrate(conn):
     for column in ("commission", "payout"):
         if column not in existing:
             conn.execute("ALTER TABLE orders ADD COLUMN {} REAL".format(column))
+
+    # Раньше WB собирался через /supplier/sales (только подтверждённые и
+    # уже рассчитанные продажи) — это давало другую картину, чем Ozon и
+    # Яндекс, которые считают все ОФОРМЛЕННЫЕ заказы. Перешли на
+    # /supplier/orders, чтобы WB считался так же, как остальные площадки
+    # (активность покупателей, а не скорость финансового расчёта WB).
+    # У новых записей другой формат order_id (srid вместо saleID), поэтому
+    # старые WB-строки не перезапишутся сами — без явной чистки они бы
+    # задвоили цифры в отчётах. Выполняется один раз.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS migrations "
+        "(name TEXT PRIMARY KEY, applied_at TEXT DEFAULT CURRENT_TIMESTAMP)"
+    )
+    applied = conn.execute(
+        "SELECT 1 FROM migrations WHERE name = ?", ("wb_orders_not_sales",)
+    ).fetchone()
+    if not applied:
+        conn.execute("DELETE FROM orders WHERE marketplace = 'wb'")
+        conn.execute("INSERT INTO migrations (name) VALUES (?)", ("wb_orders_not_sales",))
+
     conn.commit()
 
 

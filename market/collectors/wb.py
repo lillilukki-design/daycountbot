@@ -1,12 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-Сбор данных о продажах с Wildberries — API Статистики.
+Сбор данных о заказах с Wildberries — API Статистики.
 Документация: https://openapi.wildberries.ru (раздел "Статистика").
+
+Основной сбор (collect(), см. ниже) идёт через /supplier/orders — все
+оформленные заказы по дате оформления, так же, как считаются Ozon и
+Яндекс: это активность покупателей, а не финансовый расчёт WB. Отдельно
+есть collect_feed_summary() на /supplier/sales — для сверки, сколько из
+этих заказов WB уже провёл как продажу и посчитал к выплате (/wbfeed).
 
 Особенности, которые уже учтены:
 - Токен передаётся в заголовке Authorization БЕЗ слова "Bearer".
-- API отдаёт лимит примерно 1 запрос в минуту на метод — здесь дергаем
-  всего один раз за запуск, так что это не проблема.
+- API отдаёт лимит примерно 1 запрос в минуту НА МЕТОД (то есть у
+  /supplier/sales и /supplier/orders лимиты считаются раздельно).
+- dateFrom у ОБОИХ методов фильтрует не по дате продажи/заказа, а по
+  ДАТЕ ПОСЛЕДНЕГО ИЗМЕНЕНИЯ записи (lastChangeDate) — это официально
+  задокументированное поведение WB. Поэтому дату продажи/заказа мы
+  всё равно дополнительно проверяем сами после получения ответа.
 - Если WB поменяет формат ответа, сломается только эта функция —
   остальной код (база, отчёт) не пострадает.
 """
@@ -17,15 +27,17 @@ import requests
 
 from .common import mock_orders, check_response
 
-API_URL = "https://statistics-api.wildberries.ru/api/v1/supplier/sales"
+SALES_URL = "https://statistics-api.wildberries.ru/api/v1/supplier/sales"
+ORDERS_URL = "https://statistics-api.wildberries.ru/api/v1/supplier/orders"
+
+# Оставлено для обратной совместимости — старое имя константы.
+API_URL = SALES_URL
 
 
-def collect(config, date_from, date_to, mock=False):
-    if mock:
-        return mock_orders("wb", date_from, date_to, seed="wb")
-
-    token = config["WB_TOKEN"]
-    headers = {"Authorization": token}
+def _wb_get(url, headers, date_from, label):
+    """Общий поход в любой из методов WB Статистики с обработкой лимита
+    запросов (429) — вынесено в одну функцию, чтобы /supplier/sales и
+    /supplier/orders не дублировали одну и ту же логику ожидания."""
     params = {"dateFrom": date_from.strftime("%Y-%m-%d")}
 
     # У этого метода WB лимит запросов. Если недавно уже дёргали его
@@ -37,43 +49,72 @@ def collect(config, date_from, date_to, mock=False):
     MAX_AUTO_WAIT = 90
     resp = None
     for attempt in range(2):
-        resp = requests.get(API_URL, headers=headers, params=params, timeout=60)
+        resp = requests.get(url, headers=headers, params=params, timeout=60)
         if resp.status_code == 429 and attempt == 0:
             wait_seconds = int(resp.headers.get("X-Ratelimit-Retry", 65))
             if wait_seconds <= MAX_AUTO_WAIT:
-                print("  (WB просит подождать из-за лимита запросов, жду {} сек...)".format(wait_seconds))
+                print("  (WB ({}) просит подождать из-за лимита запросов, жду {} сек...)".format(
+                    label, wait_seconds))
                 time.sleep(wait_seconds)
                 continue
             else:
                 minutes = round(wait_seconds / 60)
                 raise RuntimeError(
-                    "Wildberries временно ограничил запросы — просит подождать "
+                    "Wildberries временно ограничил запросы ({}) — просит подождать "
                     "около {} мин. Обычно это проходит само; попробуйте собрать "
-                    "данные позже (например, через час).".format(minutes)
+                    "данные позже (например, через час).".format(label, minutes)
                 )
         break
 
     check_response(resp)
-    raw_sales = resp.json()
-    print("     (сырых записей от WB до фильтра по датам: {})".format(len(raw_sales)))
-    if raw_sales:
-        print("     [диагностика WB] первая запись: {}".format(
-            json.dumps(raw_sales[0], ensure_ascii=False)[:400]))
+    raw = resp.json()
+    print("     (сырых записей от WB [{}] до фильтра по датам: {})".format(label, len(raw)))
+    if raw:
+        print("     [диагностика WB {}] первая запись: {}".format(
+            label, json.dumps(raw[0], ensure_ascii=False)[:400]))
+        dates = sorted((r.get("date") or "")[:10] for r in raw)
+        print("     [диагностика WB {}] диапазон дат в сыром ответе: {} .. {}".format(
+            label, dates[0], dates[-1]))
+    return raw
+
+
+def collect(config, date_from, date_to, mock=False):
+    """Основной сбор для /today, /collect, /month и утреннего авто-отчёта.
+
+    Раньше здесь был /supplier/sales (только подтверждённые и уже
+    рассчитанные WB продажи) — из-за этого WB в отчётах считался
+    принципиально иначе, чем Ozon и Яндекс: те показывают АКТИВНОСТЬ
+    покупателей (все оформленные заказы), а WB показывал скорость
+    собственного финансового расчёта, которая может отставать от
+    реального выкупа на дни. Сейчас источник — /supplier/orders: все
+    заказы по дате оформления, как у остальных площадок. Отменённые
+    (isCancel) помечаются как "возврат" и не идут в выручку — так же,
+    как реальный возврат считается для остальных площадок.
+
+    Если нужна именно финансовая сверка (сколько WB уже реально провёл
+    как продажу и посчитал к выплате) — для этого отдельная функция
+    collect_feed_summary() и команда /wbfeed, она осталась на
+    /supplier/sales."""
+    if mock:
+        return mock_orders("wb", date_from, date_to, seed="wb")
+
+    token = config["WB_TOKEN"]
+    headers = {"Authorization": token}
+    raw_orders = _wb_get(ORDERS_URL, headers, date_from, "заказы")
+
+    date_from_s = date_from.strftime("%Y-%m-%d")
+    date_to_s = date_to.strftime("%Y-%m-%d")
 
     orders = []
-    for sale in raw_sales:
-        sale_date = (sale.get("date") or "")[:10]
-        if sale_date < date_from.strftime("%Y-%m-%d") or sale_date > date_to.strftime("%Y-%m-%d"):
+    for raw in raw_orders:
+        order_date = (raw.get("date") or "")[:10]
+        if order_date < date_from_s or order_date > date_to_s:
             continue
 
-        sale_id = sale.get("saleID", "")
-        is_return = str(sale_id).upper().startswith("R")
-        price = sale.get("finishedPrice") or sale.get("priceWithDisc") or 0
-        # "forPay" — это уже сумма к перечислению поставщику (после
-        # комиссии WB и логистики), сама площадка отдаёт её прямо в этом
-        # же ответе — отдельный финансовый отчёт не нужен.
-        payout = sale.get("forPay")
-        commission = round(price - payout, 2) if payout is not None else None
+        is_cancel = bool(raw.get("isCancel"))
+        price = raw.get("priceWithDisc")
+        if price is None:
+            price = raw.get("totalPrice") or 0
 
         # У WB в этом методе нет отдельного поля с полным названием товара
         # (как у Ozon/Яндекса) — "subject" это категория ("Благовония",
@@ -82,9 +123,9 @@ def collect(config, date_from, date_to, mock=False):
         # категории бренд и артикул продавца (то, что сам продавец задавал
         # при загрузке товара на WB) — этого достаточно, чтобы отличить
         # один товар от другого, не выдумывая название, которого WB не даёт.
-        subject = sale.get("subject") or ""
-        brand = sale.get("brand") or ""
-        supplier_article = sale.get("supplierArticle") or ""
+        subject = raw.get("subject") or ""
+        brand = raw.get("brand") or ""
+        supplier_article = raw.get("supplierArticle") or ""
         name_parts = [p for p in (subject, brand) if p]
         if supplier_article:
             name_parts.append("арт. {}".format(supplier_article))
@@ -93,15 +134,74 @@ def collect(config, date_from, date_to, mock=False):
         orders.append(
             {
                 "marketplace": "wb",
-                "order_id": str(sale_id or sale.get("srid", "")),
-                "date": sale_date,
-                "sku": str(sale.get("nmId", "")),
+                "order_id": str(raw.get("srid") or raw.get("odid") or raw.get("gNumber") or ""),
+                "date": order_date,
+                "sku": str(raw.get("nmId", "")),
                 "product_name": product_name,
                 "quantity": 1,
                 "price": price,
-                "status": "возврат" if is_return else "продано",
-                "commission": commission,
-                "payout": payout,
+                "status": "возврат" if is_cancel else "заказ",
+                # На стадии "заказ оформлен" WB ещё не считает комиссию и
+                # выплату — это появляется только после /supplier/sales
+                # (см. collect_feed_summary), поэтому здесь честно пусто,
+                # а не придуманный ноль.
+                "commission": None,
+                "payout": None,
             }
         )
     return orders
+
+
+def collect_feed_summary(config, date_from, date_to):
+    """Сводка по 'ленте заказов' WB за период, посчитанная через API —
+    аналог бесплатного отчёта в кабинете WB (Создан/Выкуплен/Отказ), но
+    без ручной выгрузки Excel. Логика:
+
+    - /supplier/orders даёт ВСЕ заказы за период (сколько бы их ни было
+      выкуплено, отменено или ещё не обработано) и явный флаг isCancel
+      для отказов/отмен.
+    - /supplier/sales даёт только те заказы, которые WB уже полностью
+      провёл как продажу (посчитан forPay к выплате). Не все выкупленные
+      заказы сразу попадают сюда — расчёт может занять время уже после
+      физического выкупа, отсюда и разница с "Выкуплен" в кабинете.
+
+    Заказ, которого нет среди отмен и нет среди рассчитанных продаж,
+    считаем "в процессе" (either ещё не выкуплен, либо выкуплен, но WB
+    ещё не провёл по нему финансовый расчёт) — это и есть основной
+    источник расхождения между /month и кабинетом WB."""
+    token = config["WB_TOKEN"]
+    headers = {"Authorization": token}
+
+    date_from_s = date_from.strftime("%Y-%m-%d")
+    date_to_s = date_to.strftime("%Y-%m-%d")
+
+    def in_range(raw_date):
+        d = (raw_date or "")[:10]
+        return date_from_s <= d <= date_to_s
+
+    raw_orders = _wb_get(ORDERS_URL, headers, date_from, "заказы")
+    raw_sales = _wb_get(SALES_URL, headers, date_from, "продажи")
+
+    orders = [o for o in raw_orders if in_range(o.get("date"))]
+    # srid — сквозной идентификатор заказа, общий у /orders и /sales
+    # (так их и предлагает сверять сама WB) — по нему сопоставляем, стал
+    # ли конкретный заказ уже рассчитанной продажей.
+    settled_srids = {s.get("srid") for s in raw_sales if in_range(s.get("date")) and s.get("srid")}
+
+    def price_of(o):
+        return float(o.get("priceWithDisc") or o.get("totalPrice") or 0)
+
+    cancelled = [o for o in orders if o.get("isCancel")]
+    active_orders = [o for o in orders if not o.get("isCancel")]
+    settled = [o for o in active_orders if o.get("srid") in settled_srids]
+    pending = [o for o in active_orders if o.get("srid") not in settled_srids]
+
+    def summarize(lst):
+        return {"count": len(lst), "sum": round(sum(price_of(o) for o in lst), 2)}
+
+    return {
+        "total": summarize(orders),
+        "cancelled": summarize(cancelled),
+        "settled": summarize(settled),
+        "pending": summarize(pending),
+    }

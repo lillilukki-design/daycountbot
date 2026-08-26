@@ -644,6 +644,7 @@ from market.collect_and_notify import (  # noqa: E402
     build_report_text_for_range,
     collect_for_date,
     collect_for_range,
+    wb_feed_summary,
 )
 
 MARKET_DAILY_TIME = time(9, 0, tzinfo=DEFAULT_TZ)
@@ -809,6 +810,62 @@ async def market_month_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
 
+def _money(value):
+    return "{:,.0f} ₽".format(value or 0).replace(",", " ")
+
+
+async def market_wbfeed_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Сверка WB напрямую через API — аналог бесплатного отчёта 'Лента
+    заказов' в кабинете WB (Создан/Выкуплен/Отказ), но без ручной выгрузки
+    Excel. Нужна, чтобы объяснить, почему /month по WB обычно меньше,
+    чем "выкуплено" в кабинете: WB не сразу проводит выкупленный заказ
+    как рассчитанную продажу (это и есть 'ещё в процессе' ниже)."""
+    message = update.effective_message
+    chat_id = message.chat_id
+    now = datetime.now(DEFAULT_TZ)
+    date_from = now.date().replace(day=1)
+    date_to = now.date()
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="Сверяю ленту заказов WB с {} по {} напрямую по API, подожди немного "
+             "(два отдельных запроса, может занять минуту-другую при лимитах WB)…".format(
+                 date_from.strftime("%d.%m.%Y"), date_to.strftime("%d.%m.%Y")
+             ),
+    )
+    try:
+        summary = await asyncio.to_thread(wb_feed_summary, date_from, date_to)
+    except Exception as exc:
+        log.exception("Ошибка при сверке ленты заказов WB (/wbfeed): %s", exc)
+        await context.bot.send_message(
+            chat_id=chat_id, text="Не получилось сверить — {}".format(exc),
+            reply_markup=MARKET_KEYBOARD,
+        )
+        return
+
+    total = summary["total"]
+    cancelled = summary["cancelled"]
+    settled = summary["settled"]
+    pending = summary["pending"]
+    text = (
+        "🧾 Лента заказов WB за {}..{} (напрямую по API)\n\n"
+        "Всего заказов: {} шт., {}\n"
+        "  • Отказы/отмены: {} шт., {}\n"
+        "  • Уже проведено как продажа (это и есть цифра в /month): {} шт., {}\n"
+        "  • Выкуплены или ещё активны, но WB пока не провёл расчёт: {} шт., {}\n\n"
+        "Если последняя строка большая — /month по WB не ошибается, просто WB "
+        "ещё не досчитал эти заказы как продажи (обычно это занимает какое-то "
+        "время уже после выкупа)."
+    ).format(
+        date_from.strftime("%d.%m.%Y"), date_to.strftime("%d.%m.%Y"),
+        total["count"], _money(total["sum"]),
+        cancelled["count"], _money(cancelled["sum"]),
+        settled["count"], _money(settled["sum"]),
+        pending["count"], _money(pending["sum"]),
+    )
+    await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=MARKET_KEYBOARD)
+
+
 MARKET_BUTTON_HANDLERS = {
     "📅 Отчёт за вчера": market_report_cmd,
     "🔄 Обновить за вчера": market_collect_cmd,
@@ -856,6 +913,7 @@ def build_market_app() -> Optional[Application]:
     market_app.add_handler(CommandHandler("collect", market_collect_cmd))
     market_app.add_handler(CommandHandler("today", market_today_cmd))
     market_app.add_handler(CommandHandler("month", market_month_cmd))
+    market_app.add_handler(CommandHandler("wbfeed", market_wbfeed_cmd))
     market_app.add_handler(CommandHandler("myid", market_myid_cmd))
     # Нажатия на кнопки постоянной клавиатуры приходят как обычный текст —
     # этот хэндлер должен идти последним и не перехватывать команды (~filters.COMMAND).

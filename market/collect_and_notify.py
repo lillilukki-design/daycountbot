@@ -82,6 +82,19 @@ def build_report_text_for_range(date_from, date_to, period_label=None):
     )
 
 
+def wb_feed_summary(date_from, date_to):
+    """Сводка по 'ленте заказов' WB за период — прямой вызов API
+    Wildberries (методы /supplier/orders и /supplier/sales), без ручной
+    выгрузки Excel из личного кабинета. См. wb.collect_feed_summary для
+    логики сопоставления "заказ -> отмена / рассчитанная продажа / ещё
+    в процессе"."""
+    config = load_config()
+    missing = check_config(config, "wb")
+    if missing:
+        raise RuntimeError("не заполнены переменные окружения: {}".format(", ".join(missing)))
+    return wb.collect_feed_summary(config, date_from, date_to)
+
+
 async def collect_and_notify(bot, chat_id, target_date=None):
     """Собирает данные за вчера (по умолчанию) и присылает сводку в Telegram.
     bot — telegram.Bot соответствующего приложения.
