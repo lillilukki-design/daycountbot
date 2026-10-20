@@ -10,6 +10,7 @@ FBS (свой склад/сборка), потому что заранее не 
 ошибка.
 """
 import logging
+import time
 
 import requests
 
@@ -29,6 +30,46 @@ FBS_URL = "https://api-seller.ozon.ru/v3/posting/fbs/list"
 # (снижено со 200: тот лимит один раз реально сработал на зацикливании
 # и съел лишнюю минуту на 200 бесполезных запросов).
 MAX_PAGES = 50
+
+# Сколько раз пробуем повторить запрос, если Ozon ответил 429 "лимит
+# запросов в секунду" (code 8). Раньше это просто падало и обрывало
+# сбор по Ozon целиком (см. отчёт за 20.10 — "HTTP 429 Too Many
+# Requests... request limit per second"). Чем больше накопилось
+# заказов за месяцы, тем больше страниц надо пролистать courier'ом по
+# времени (_fetch_postings), и подряд идущие запросы без паузы стали
+# упираться в этот лимит — раньше заказов было мало, страниц было
+# 1-2, и лимит просто не успевал сработать.
+MAX_RETRIES_429 = 5
+
+# Пауза между соседними запросами к Ozon — целиком по собственной
+# инициативе, не только в ответ на 429: сильно снижает шанс вообще
+# получить лимит, а не просто красиво падать и ждать потом.
+REQUEST_PAUSE_SECONDS = 0.5
+
+
+def _post_with_retry(url, headers, body, label):
+    """requests.post с повтором при HTTP 429 (лимит запросов в секунду).
+    Ozon не всегда присылает Retry-After — если его нет, ждём с
+    экспоненциально растущей паузой (1с, 2с, 4с...) вместо падения."""
+    delay = 1.0
+    resp = None
+    for attempt in range(MAX_RETRIES_429):
+        resp = requests.post(url, headers=headers, json=body, timeout=60)
+        if resp.status_code != 429:
+            return resp
+        retry_after = resp.headers.get("Retry-After")
+        wait = float(retry_after) if retry_after else delay
+        log.info(
+            "Ozon (%s): лимит запросов в секунду (429), жду %.1f сек и пробую "
+            "снова (попытка %d/%d)...",
+            label, wait, attempt + 1, MAX_RETRIES_429,
+        )
+        time.sleep(wait)
+        delay = min(delay * 2, 10.0)
+    # Все попытки исчерпаны — возвращаем последний ответ как есть,
+    # check_response сам превратит его в понятную ошибку пользователю,
+    # а не бросит голый 429 без объяснения.
+    return resp
 
 
 def _fetch_postings(url, headers, since, to):
@@ -52,6 +93,13 @@ def _fetch_postings(url, headers, since, to):
     limit = 100  # у Ozon для этих методов лимит строго от 1 до 100
     cursor_since = since
     for page in range(MAX_PAGES):
+        if page > 0:
+            # Пауза перед КАЖДОЙ следующей страницей (не перед первой) —
+            # чем больше накопилось заказов, тем больше страниц, и без
+            # паузы подряд идущие запросы упираются в лимит Ozon "запросов
+            # в секунду" (см. комментарий у REQUEST_PAUSE_SECONDS).
+            time.sleep(REQUEST_PAUSE_SECONDS)
+
         body = {
             "dir": "ASC",
             "filter": {"since": cursor_since, "to": to},
@@ -59,7 +107,7 @@ def _fetch_postings(url, headers, since, to):
             "offset": 0,
             "with": {"financial_data": True},
         }
-        resp = requests.post(url, headers=headers, json=body, timeout=60)
+        resp = _post_with_retry(url, headers, body, url)
         check_response(resp)
         data = resp.json()
         # У FBS ответ обёрнут в {"result": {...}}, а у FBO — postings
@@ -154,6 +202,11 @@ def collect(config, date_from, date_to, mock=False):
     to = to_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
     fbo_postings = _fetch_postings(FBO_URL, headers, since, to)
+    # Короткая пауза между FBO и FBS — это два разных метода, но оба
+    # считаются Ozon-ом в один и тот же общий лимит "запросов в секунду",
+    # так что без паузы последняя страница FBO и первая страница FBS
+    # могут попасть в одну и ту же секунду.
+    time.sleep(REQUEST_PAUSE_SECONDS)
     fbs_postings = _fetch_postings(FBS_URL, headers, since, to)
     log.info("Ozon: по схеме FBO %d отправлений, по схеме FBS %d отправлений (since=%s, to=%s)",
              len(fbo_postings), len(fbs_postings), since, to)
