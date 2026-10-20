@@ -43,26 +43,39 @@ MAX_RETRIES_429 = 5
 
 # Пауза между соседними запросами к Ozon — целиком по собственной
 # инициативе, не только в ответ на 429: сильно снижает шанс вообще
-# получить лимит, а не просто красиво падать и ждать потом.
-REQUEST_PAUSE_SECONDS = 0.5
+# получить лимит, а не просто красиво падать и ждать потом. Поднято с
+# 0.5 до 1.0 — на практике (20.10) лимит срабатывал даже при паузе 0.5с,
+# похоже лимит у Ozon строже либо делится с другой активностью на
+# аккаунте (например открытый личный кабинет).
+REQUEST_PAUSE_SECONDS = 1.0
 
 
 def _post_with_retry(url, headers, body, label):
     """requests.post с повтором при HTTP 429 (лимит запросов в секунду).
-    Ozon не всегда присылает Retry-After — если его нет, ждём с
-    экспоненциально растущей паузой (1с, 2с, 4с...) вместо падения."""
+    ВАЖНО (увидено в проде 20.10): Ozon в заголовке Retry-After присылает
+    "0" — если слепо доверять этому значению, пауза получается нулевой и
+    повтор происходит почти мгновенно, лимит не успевает отпустить, и все
+    попытки проваливаются за доли секунды. Поэтому Retry-After учитываем
+    только если он реально БОЛЬШЕ нашей собственной растущей паузы — иначе
+    используем её (1с, 2с, 4с, 8с...)."""
     delay = 1.0
     resp = None
     for attempt in range(MAX_RETRIES_429):
         resp = requests.post(url, headers=headers, json=body, timeout=60)
         if resp.status_code != 429:
             return resp
-        retry_after = resp.headers.get("Retry-After")
-        wait = float(retry_after) if retry_after else delay
+        retry_after_header = resp.headers.get("Retry-After")
+        retry_after = None
+        if retry_after_header:
+            try:
+                retry_after = float(retry_after_header)
+            except ValueError:
+                retry_after = None
+        wait = max(retry_after or 0.0, delay)
         log.info(
-            "Ozon (%s): лимит запросов в секунду (429), жду %.1f сек и пробую "
-            "снова (попытка %d/%d)...",
-            label, wait, attempt + 1, MAX_RETRIES_429,
+            "Ozon (%s): лимит запросов в секунду (429, Retry-After=%s), жду %.1f сек и "
+            "пробую снова (попытка %d/%d)...",
+            label, retry_after_header, wait, attempt + 1, MAX_RETRIES_429,
         )
         time.sleep(wait)
         delay = min(delay * 2, 10.0)
