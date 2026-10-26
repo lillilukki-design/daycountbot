@@ -19,7 +19,15 @@ from .common import mock_orders, check_response, msk_day_bounds_utc, to_msk_date
 log = logging.getLogger("market")
 
 FBO_URL = "https://api-seller.ozon.ru/v3/posting/fbo/list"
-FBS_URL = "https://api-seller.ozon.ru/v3/posting/fbs/list"
+# ВАЖНО (26.10): v3/posting/fbs/list Ozon отключил 31.08.2026 — сперва это
+# выглядело как лимит "429 запросов в секунду" (видимо, метод специально
+# притормаживали перед отключением), затем стало "400 obsolete method
+# cannot be used", а потом и вовсе "404 page not found" (метод убрали
+# совсем). Официальная замена — v4/posting/fbs/list, у него другой формат
+# пагинации (честный cursor вместо offset) — см. _fetch_fbs_postings.
+# v2/posting/fbo/list Ozon отключил тогда же, но мы и так уже были на v3 —
+# FBO эта отмена не касается.
+FBS_URL = "https://api-seller.ozon.ru/v4/posting/fbs/list"
 
 # Предохранитель от зависания: если Ozon почему-то будет бесконечно
 # отвечать has_next=true (баг на его стороне или у нас в разборе
@@ -86,21 +94,23 @@ def _post_with_retry(url, headers, body, label):
 
 
 def _fetch_postings(url, headers, since, to):
-    """Постранично собирает отправления за период.
+    """Постранично собирает отправления FBO (v3/posting/fbo/list) за период.
 
-    ВАЖНО: у метода FBO (v3/posting/fbo/list) на практике offset не
-    работает — при любом значении offset Ozon возвращает одну и ту же
-    первую сотню отправлений, а has_next остаётся true бесконечно (это
-    подтверждено диагностикой ниже: одинаковый диапазон in_process_at и
-    100% повторов posting_number на каждой "странице"). Поэтому вместо
-    offset двигаем окно по времени: после полной пачки в 100 штук
-    следующий запрос делаем с since = in_process_at последней записи в
-    пачке (since у Ozon включительно, поэтому пограничная запись придёт
-    повторно — отсекаем её через seen_numbers, а не пропуском по дате,
-    чтобы не потерять другие отправления с точно такой же меткой
-    времени). offset всё равно передаём (вдруг когда-нибудь заработает),
-    но останавливаемся по фактическому появлению новых записей, а не по
-    его значению."""
+    ВАЖНО: у метода FBO на практике offset не работает — при любом
+    значении offset Ozon возвращает одну и ту же первую сотню отправлений,
+    а has_next остаётся true бесконечно (это подтверждено диагностикой
+    ниже: одинаковый диапазон in_process_at и 100% повторов posting_number
+    на каждой "странице"). Поэтому вместо offset двигаем окно по времени:
+    после полной пачки в 100 штук следующий запрос делаем с since =
+    in_process_at последней записи в пачке (since у Ozon включительно,
+    поэтому пограничная запись придёт повторно — отсекаем её через
+    seen_numbers, а не пропуском по дате, чтобы не потерять другие
+    отправления с точно такой же меткой времени). offset всё равно
+    передаём (вдруг когда-нибудь заработает), но останавливаемся по
+    фактическому появлению новых записей, а не по его значению.
+
+    Для FBS этот костыль больше не нужен — см. _fetch_fbs_postings, у v4
+    пагинация честным курсором."""
     postings = []
     seen_numbers = set()
     limit = 100  # у Ozon для этих методов лимит строго от 1 до 100
@@ -123,9 +133,9 @@ def _fetch_postings(url, headers, since, to):
         resp = _post_with_retry(url, headers, body, url)
         check_response(resp)
         data = resp.json()
-        # У FBS ответ обёрнут в {"result": {...}}, а у FBO — postings
-        # лежит прямо в корне ответа, без обёртки "result". Обрабатываем
-        # оба варианта одним кодом.
+        # У некоторых версий ответ обёрнут в {"result": {...}}, у других —
+        # postings лежит прямо в корне ответа, без обёртки "result".
+        # Обрабатываем оба варианта одним кодом на всякий случай.
         result = data.get("result", data) if isinstance(data, dict) else {}
         batch = result.get("postings", []) if isinstance(result, dict) else []
 
@@ -156,6 +166,65 @@ def _fetch_postings(url, headers, since, to):
         log.warning(
             "Ozon (%s): остановился после %d страниц (%d новых отправлений) — курсор по "
             "времени не дошёл до конца периода за отведённое число страниц.",
+            url, MAX_PAGES, len(postings),
+        )
+    return postings
+
+
+def _fetch_fbs_postings(url, headers, since, to):
+    """Постранично собирает отправления FBS через v4/posting/fbs/list.
+
+    В отличие от FBO (см. _fetch_postings), у v4 честная курсорная
+    пагинация: сервер сам присылает cursor для следующей страницы и
+    has_next — никаких костылей с offset или окном по времени тут не
+    нужно. Формат запроса у v4 немного другой: вместо "offset" — top-level
+    поле "cursor" (пустая строка для первой страницы), вместо "dir" —
+    "sort_dir", а ответ приходит без обёртки "result" (postings, cursor и
+    has_next — прямо в корне)."""
+    postings = []
+    seen_numbers = set()
+    limit = 100
+    cursor = ""
+    for page in range(MAX_PAGES):
+        if page > 0:
+            time.sleep(REQUEST_PAUSE_SECONDS)
+
+        body = {
+            "filter": {"since": since, "to": to},
+            "limit": limit,
+            "cursor": cursor,
+            "sort_dir": "ASC",
+            "with": {"financial_data": True},
+        }
+        resp = _post_with_retry(url, headers, body, url)
+        check_response(resp)
+        data = resp.json()
+        batch = data.get("postings", []) if isinstance(data, dict) else []
+        has_next = bool(data.get("has_next")) if isinstance(data, dict) else False
+        next_cursor = data.get("cursor") or "" if isinstance(data, dict) else ""
+
+        new_in_batch = [p for p in batch if p.get("posting_number") not in seen_numbers]
+        repeats = len(batch) - len(new_in_batch)
+        for p in new_in_batch:
+            seen_numbers.add(p.get("posting_number"))
+        postings.extend(new_in_batch)
+
+        log.info(
+            "Ozon (%s) страница %d: получено=%d (новых=%d, повторов=%d), has_next=%s",
+            url, page, len(batch), len(new_in_batch), repeats, has_next,
+        )
+
+        if not has_next or not next_cursor or next_cursor == cursor:
+            # has_next=false — данные закончились. Пустой/повторяющийся
+            # курсор — подстраховка от зацикливания, если Ozon вдруг
+            # пришлёт то же самое значение (аналогично тому, как раньше
+            # ловили залипание offset у FBO).
+            break
+        cursor = next_cursor
+    else:
+        log.warning(
+            "Ozon (%s): остановился после %d страниц (%d новых отправлений) — курсор "
+            "не дошёл до конца периода за отведённое число страниц.",
             url, MAX_PAGES, len(postings),
         )
     return postings
@@ -220,7 +289,7 @@ def collect(config, date_from, date_to, mock=False):
     # так что без паузы последняя страница FBO и первая страница FBS
     # могут попасть в одну и ту же секунду.
     time.sleep(REQUEST_PAUSE_SECONDS)
-    fbs_postings = _fetch_postings(FBS_URL, headers, since, to)
+    fbs_postings = _fetch_fbs_postings(FBS_URL, headers, since, to)
     log.info("Ozon: по схеме FBO %d отправлений, по схеме FBS %d отправлений (since=%s, to=%s)",
              len(fbo_postings), len(fbs_postings), since, to)
 
